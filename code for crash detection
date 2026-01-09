@@ -1,0 +1,310 @@
+#include <Wire.h>
+
+// MPU6050 I2C address
+const int MPU6050_ADDR = 0x68;
+
+// Pin definitions
+#define BUZZER_PIN 8
+#define GREEN_LED 9
+#define YELLOW_LED 10
+#define RED_LED 11
+#define CANCEL_BUTTON 2
+
+// Threshold values adjusted for Wokwi
+#define NORMAL_THRESHOLD 0.5
+#define HARD_BRAKE_THRESHOLD 0.8
+#define CRASH_THRESHOLD 1.3
+
+// System states
+enum SystemState {
+  NORMAL,
+  HARD_BRAKE_DETECTED,
+  CRASH_DETECTED,
+  COUNTDOWN,
+  ALERT_SENT
+};
+
+SystemState currentState = NORMAL;
+
+// Variables
+float accelMagnitude;
+int hardBrakeCount = 0;
+unsigned long countdownStartTime = 0;
+unsigned long lastBeepTime = 0;
+int countdownSeconds = 15;
+bool alertCancelled = false;
+unsigned long stateChangeTime = 0;
+
+// Simulated GPS coordinates
+float gpsLat = 13.0827;
+float gpsLon = 80.2707;
+
+void setup() {
+  Serial.begin(115200);
+  while(!Serial) delay(10);
+  
+  // Initialize I2C
+  Wire.begin();
+  delay(100);
+  
+  Serial.println("Initializing MPU6050...");
+  
+  // Wake up MPU6050
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B); // PWR_MGMT_1 register
+  Wire.write(0);    // Wake up
+  Wire.endTransmission(true);
+  delay(100);
+  
+  // Test connection
+  Wire.beginTransmission(MPU6050_ADDR);
+  byte error = Wire.endTransmission();
+  
+  if (error == 0) {
+    Serial.println("MPU6050 connection successful!");
+  } else {
+    Serial.println("MPU6050 connection failed!");
+    Serial.print("Error code: ");
+    Serial.println(error);
+  }
+  
+  // Configure accelerometer range (±8g)
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x1C); // ACCEL_CONFIG register
+  Wire.write(0x10); // ±8g range
+  Wire.endTransmission(true);
+  
+  Serial.println("Accelerometer range set to: ±8G");
+  
+  // Pin modes
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(YELLOW_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(CANCEL_BUTTON, INPUT_PULLUP);
+  
+  // Attach interrupt
+  attachInterrupt(digitalPinToInterrupt(CANCEL_BUTTON), cancelAlert, FALLING);
+  
+  // Initial state
+  digitalWrite(GREEN_LED, HIGH);
+  Serial.println("System Ready - Monitoring for accidents...");
+  Serial.println("========================================");
+  Serial.println("\nWOKWI TESTING GUIDE:");
+  Serial.println("- Hard Brake: Move ONE axis to max (2g)");
+  Serial.println("- Crash: Move MULTIPLE axes simultaneously");
+  Serial.println("  Example: X=2g + Y=2g for crash");
+  Serial.println("========================================\n");
+}
+
+void loop() {
+  // Read accelerometer data
+  int16_t ax, ay, az;
+  
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x3B); // Starting register for accel data
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 6, true);
+  
+  ax = Wire.read() << 8 | Wire.read();
+  ay = Wire.read() << 8 | Wire.read();
+  az = Wire.read() << 8 | Wire.read();
+  
+  // Convert to g-force (±8g range: 4096 LSB/g)
+  float ax_g = abs(ax / 4096.0);
+  float ay_g = abs(ay / 4096.0);
+  float az_g = abs(az / 4096.0);
+  
+  // Calculate total acceleration magnitude
+  accelMagnitude = sqrt(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
+  
+  // Remove gravity baseline
+  accelMagnitude = abs(accelMagnitude - 1.0);
+  
+  // Count active axes (for crash detection)
+  int activeAxes = 0;
+  if (ax_g > 0.5) activeAxes++;
+  if (ay_g > 0.5) activeAxes++;
+  if (az_g > 0.5) activeAxes++;
+  
+  // State machine
+  switch(currentState) {
+    case NORMAL:
+      handleNormalState(activeAxes);
+      break;
+      
+    case HARD_BRAKE_DETECTED:
+      handleHardBrakeState();
+      break;
+      
+    case CRASH_DETECTED:
+      handleCrashDetectedState();
+      break;
+      
+    case COUNTDOWN:
+      handleCountdownState();
+      break;
+      
+    case ALERT_SENT:
+      handleAlertSentState();
+      break;
+  }
+  
+  delay(100);
+}
+
+void handleNormalState(int activeAxes) {
+  digitalWrite(GREEN_LED, HIGH);
+  digitalWrite(YELLOW_LED, LOW);
+  digitalWrite(RED_LED, LOW);
+  
+  // CRASH: Multiple axes activated (multi-directional impact)
+  if (accelMagnitude >= CRASH_THRESHOLD && activeAxes >= 2) {
+    currentState = CRASH_DETECTED;
+    Serial.println("\n!!! CRASH DETECTED !!!");
+    Serial.print("Impact force: ");
+    Serial.print(accelMagnitude);
+    Serial.println("g");
+    Serial.print("Active axes: ");
+    Serial.println(activeAxes);
+    Serial.println("Multi-directional impact detected!");
+  } 
+  // HARD BRAKE: Single axis
+  else if (accelMagnitude >= HARD_BRAKE_THRESHOLD && accelMagnitude < CRASH_THRESHOLD) {
+    currentState = HARD_BRAKE_DETECTED;
+    hardBrakeCount++;
+    stateChangeTime = millis();
+    Serial.println("\n--- Hard Brake Detected ---");
+    Serial.print("Brake force: ");
+    Serial.print(accelMagnitude);
+    Serial.println("g");
+    Serial.print("Total hard brakes: ");
+    Serial.println(hardBrakeCount);
+  }
+  // Alternative: Very high total force
+  else if (accelMagnitude >= 1.5) {
+    currentState = CRASH_DETECTED;
+    Serial.println("\n!!! CRASH DETECTED !!!");
+    Serial.print("Severe impact: ");
+    Serial.print(accelMagnitude);
+    Serial.println("g");
+  }
+}
+
+void handleHardBrakeState() {
+  digitalWrite(GREEN_LED, LOW);
+  
+  unsigned long blinkTime = millis() - stateChangeTime;
+  if (blinkTime < 1000) {
+    digitalWrite(YELLOW_LED, (millis() / 200) % 2);
+  } else {
+    digitalWrite(YELLOW_LED, LOW);
+    currentState = NORMAL;
+    Serial.println("Resuming normal monitoring...\n");
+  }
+}
+
+void handleCrashDetectedState() {
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED, HIGH);
+  
+  Serial.println("========================================");
+  Serial.println("EMERGENCY PROTOCOL INITIATED");
+  Serial.println("========================================");
+  
+  currentState = COUNTDOWN;
+  countdownStartTime = millis();
+  countdownSeconds = 15;
+  alertCancelled = false;
+  lastBeepTime = millis();
+  
+  Serial.println("Starting 15-second countdown...");
+  Serial.println("Press CANCEL button to abort alert!");
+}
+
+void handleCountdownState() {
+  unsigned long elapsed = (millis() - countdownStartTime) / 1000;
+  int remaining = 15 - elapsed;
+  
+  if (alertCancelled) {
+    Serial.println("\n*** ALERT CANCELLED BY USER ***");
+    Serial.println("Resuming normal monitoring...\n");
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+    currentState = NORMAL;
+    alertCancelled = false;
+    return;
+  }
+  
+  if (remaining <= 0) {
+    sendEmergencyAlert();
+    currentState = ALERT_SENT;
+    return;
+  }
+  
+  if (millis() - lastBeepTime >= 1000) {
+    Serial.print("Alert in: ");
+    Serial.print(remaining);
+    Serial.println(" seconds...");
+    
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    
+    lastBeepTime = millis();
+  }
+  
+  digitalWrite(RED_LED, (millis() / 250) % 2);
+}
+
+void handleAlertSentState() {
+  digitalWrite(RED_LED, HIGH);
+  tone(BUZZER_PIN, 2000);
+  
+  delay(300);
+  digitalWrite(RED_LED, LOW);
+  delay(300);
+}
+
+void sendEmergencyAlert() {
+  Serial.println("\n========================================");
+  Serial.println("!!! SENDING EMERGENCY ALERT !!!");
+  Serial.println("========================================");
+  
+  Serial.println("\n[GSM MODULE - SENDING SMS]");
+  Serial.println("To: Emergency Contact (+91-XXXXXXXXXX)");
+  Serial.println("Message:");
+  Serial.println("  EMERGENCY! Accident detected!");
+  Serial.print("  Location: Lat ");
+  Serial.print(gpsLat, 6);
+  Serial.print(", Lon ");
+  Serial.println(gpsLon, 6);
+  Serial.print("  Time: ");
+  Serial.print(millis() / 1000);
+  Serial.println(" seconds since startup");
+  Serial.print("  Impact Force: ");
+  Serial.print(accelMagnitude);
+  Serial.println("g");
+  Serial.println("  Status: ALERT SENT SUCCESSFULLY");
+  
+  Serial.println("\n[GPS MODULE - LOCATION DATA]");
+  Serial.print("Latitude: ");
+  Serial.println(gpsLat, 6);
+  Serial.print("Longitude: ");
+  Serial.println(gpsLon, 6);
+  Serial.println("Accuracy: 5m");
+  Serial.print("Google Maps: https://maps.google.com/?q=");
+  Serial.print(gpsLat, 6);
+  Serial.print(",");
+  Serial.println(gpsLon, 6);
+  
+  Serial.println("\n========================================");
+  Serial.println("ALERT SENT - AWAITING EMERGENCY RESPONSE");
+  Serial.println("========================================\n");
+}
+
+void cancelAlert() {
+  if (currentState == COUNTDOWN) {
+    alertCancelled = true;
+  }
+}
